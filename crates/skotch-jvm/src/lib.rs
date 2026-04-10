@@ -55,7 +55,10 @@ impl EmbeddedJvm {
         let libjvm_path = locate::find_libjvm()?;
 
         // Ensure the JVM's sibling libraries (libjava, etc.) are
-        // findable at runtime.
+        // findable at runtime. On Windows the JVM handles this
+        // internally via PATH, so we only need to set the library
+        // search path on Unix platforms.
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         if let Some(dir) = libjvm_path.parent() {
             let dir_str = dir.to_string_lossy();
             #[cfg(target_os = "macos")]
