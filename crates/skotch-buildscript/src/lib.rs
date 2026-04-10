@@ -548,8 +548,6 @@ impl<'src, 'lf> Walker<'src, 'lf> {
                             }
                             if let Some(val) = self.try_consume_string() {
                                 self.settings.included_modules.push(val);
-                            } else if self.peek() == TokenKind::Comma {
-                                self.bump();
                             } else {
                                 self.bump();
                             }
