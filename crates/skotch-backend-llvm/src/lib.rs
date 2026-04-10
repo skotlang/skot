@@ -88,6 +88,7 @@ struct Emitter<'a> {
     out: String,
     needs_puts: bool,
     needs_printf: bool,
+    needs_bool_strings: bool,
 }
 
 impl<'a> Emitter<'a> {
@@ -104,6 +105,7 @@ impl<'a> Emitter<'a> {
             out: String::new(),
             needs_puts: false,
             needs_printf: false,
+            needs_bool_strings: false,
         }
     }
 
@@ -131,6 +133,12 @@ impl<'a> Emitter<'a> {
         // String constants.
         for (i, s) in self.module.strings.iter().enumerate() {
             self.emit_c_string(&format!("@.str.{i}"), s);
+        }
+
+        // Boolean string constants for println(bool).
+        if self.needs_bool_strings {
+            self.emit_c_string("@.str.true", "true");
+            self.emit_c_string("@.str.false", "false");
         }
 
         // Pre-intern format strings used by println(int).
@@ -184,7 +192,11 @@ impl<'a> Emitter<'a> {
                             let ty = &func.locals[arg.0 as usize];
                             match ty {
                                 Ty::String => self.needs_puts = true,
-                                Ty::Int | Ty::Bool => self.needs_printf = true,
+                                Ty::Bool => {
+                                    self.needs_puts = true;
+                                    self.needs_bool_strings = true;
+                                }
+                                Ty::Int => self.needs_printf = true,
                                 _ => self.needs_puts = true,
                             }
                         } else {
@@ -437,7 +449,11 @@ impl<'a> BlockWalker<'a> {
                 // if the local was produced by a BinOp comparison.
                 // For now: always truncate, but use `i32` only if
                 // the last def was NOT an icmp.
-                let cond_is_i1 = self.is_i1_local.get(cond.0 as usize).copied().unwrap_or(false);
+                let cond_is_i1 = self
+                    .is_i1_local
+                    .get(cond.0 as usize)
+                    .copied()
+                    .unwrap_or(false);
                 let cond_i1 = if cond_is_i1 {
                     cond_ssa
                 } else {
@@ -490,7 +506,17 @@ impl<'a> BlockWalker<'a> {
         // it through the alloca pointer.
         if self.needs_alloca[dest.0 as usize] {
             let val = match rvalue {
-                Rvalue::Local(src) => self.ssa_of_maybe_alloca(*src),
+                Rvalue::Local(src) => {
+                    let v = self.ssa_of_maybe_alloca(*src);
+                    // If the source is i1 but the dest alloca is i32, extend.
+                    if self.is_i1_local[src.0 as usize] && matches!(dest_ty, Ty::Bool | Ty::Int) {
+                        let ext = self.fresh();
+                        writeln!(self.out, "  {ext} = zext i1 {v} to i32").unwrap();
+                        ext
+                    } else {
+                        v
+                    }
+                }
                 Rvalue::Const(MirConst::Int(v)) => format!("{v}"),
                 Rvalue::Const(MirConst::Bool(b)) => format!("{}", if *b { 1 } else { 0 }),
                 Rvalue::Const(MirConst::String(sid)) => {
@@ -563,13 +589,11 @@ impl<'a> BlockWalker<'a> {
                     }
                 }
             }
-            Rvalue::Call { kind, args } => {
-                match kind {
-                    CallKind::Println => self.lower_println(args),
-                    CallKind::PrintlnConcat => self.lower_println_concat(args),
-                    CallKind::Static(target_id) => self.lower_static_call(*target_id, args, dest),
-                }
-            }
+            Rvalue::Call { kind, args } => match kind {
+                CallKind::Println => self.lower_println(args),
+                CallKind::PrintlnConcat => self.lower_println_concat(args),
+                CallKind::Static(target_id) => self.lower_static_call(*target_id, args, dest),
+            },
         }
     }
 
@@ -665,7 +689,25 @@ impl<'a> BlockWalker<'a> {
             Ty::String => {
                 writeln!(self.out, "  call i32 @puts(ptr {arg_ssa})").unwrap();
             }
-            Ty::Int | Ty::Bool => {
+            Ty::Bool => {
+                // Convert i32 0/1 (or i1) to "true"/"false" string via select.
+                let cond_ssa = if self.is_i1_local[arg.0 as usize] {
+                    arg_ssa.clone()
+                } else {
+                    let c = self.fresh();
+                    writeln!(self.out, "  {c} = trunc i32 {arg_ssa} to i1").unwrap();
+                    c
+                };
+                let sel = self.fresh();
+                writeln!(
+                    self.out,
+                    "  {sel} = select i1 {cond_ssa}, ptr @.str.true, ptr @.str.false"
+                )
+                .unwrap();
+                let _ = self.fresh();
+                writeln!(self.out, "  call i32 @puts(ptr {sel})").unwrap();
+            }
+            Ty::Int => {
                 writeln!(
                     self.out,
                     "  call i32 (ptr, ...) @printf(ptr @.fmt.int_println, i32 {arg_ssa})"
@@ -759,7 +801,7 @@ fn block_label(idx: u32) -> String {
 fn llvm_type(ty: &Ty) -> &'static str {
     match ty {
         Ty::Unit => "void",
-        Ty::Bool => "i1",
+        Ty::Bool => "i32", // bools are 0/1 ints; icmp produces i1 but we zext
         Ty::Int => "i32",
         Ty::Long => "i64",
         Ty::Double => "double",

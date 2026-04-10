@@ -284,52 +284,63 @@ fn emit_method(
         slot_to_local[jvm_slot as usize] = Some(mir_id);
     }
 
-    // ── Per-block slot sets ────────────────────────────────────────
-    let mut live_at_end: Vec<Vec<bool>> = vec![vec![false; max_slots]; func.blocks.len()];
+    // ── Per-block slot sets (fixed-point iteration for loops) ─────
+    //
+    // For acyclic CFGs a single forward pass suffices. Loops introduce
+    // back-edges: the body block's live_at_end feeds into the condition
+    // block's inherited set, but the body comes later in layout.
+    // We iterate until live_at_end converges (typically 2–3 passes).
+    // Initialize with all-true (optimistic, "top" in dataflow terms).
+    // The fixed-point iteration narrows this to the correct set.
+    let mut live_at_end: Vec<Vec<bool>> = vec![vec![true; max_slots]; func.blocks.len()];
     let mut inherited_per_block: Vec<Vec<bool>> = vec![vec![false; max_slots]; func.blocks.len()];
-    for s in 0..(initial_locals_count as usize) {
-        if !live_at_end.is_empty() {
-            live_at_end[0][s] = true;
-        }
-    }
-    for (bi, _) in func.blocks.iter().enumerate() {
-        let mut inherited = vec![true; max_slots];
-        let mut has_pred = false;
-        for (pi, pblk) in func.blocks.iter().enumerate() {
-            let is_pred = match &pblk.terminator {
-                Terminator::Branch {
-                    then_block,
-                    else_block,
-                    ..
-                } => *then_block as usize == bi || *else_block as usize == bi,
-                Terminator::Goto(t) => *t as usize == bi,
-                _ => false,
-            };
-            if is_pred {
-                has_pred = true;
-                for s in 0..max_slots {
-                    inherited[s] = inherited[s] && live_at_end[pi][s];
+    for _iteration in 0..4 {
+        let mut changed = false;
+        for (bi, _) in func.blocks.iter().enumerate() {
+            let mut inherited = vec![true; max_slots];
+            let mut has_pred = false;
+            for (pi, pblk) in func.blocks.iter().enumerate() {
+                let is_pred = match &pblk.terminator {
+                    Terminator::Branch {
+                        then_block,
+                        else_block,
+                        ..
+                    } => *then_block as usize == bi || *else_block as usize == bi,
+                    Terminator::Goto(t) => *t as usize == bi,
+                    _ => false,
+                };
+                if is_pred {
+                    has_pred = true;
+                    for s in 0..max_slots {
+                        inherited[s] = inherited[s] && live_at_end[pi][s];
+                    }
                 }
             }
-        }
-        if !has_pred && bi == 0 {
-            for (s, val) in inherited.iter_mut().enumerate() {
-                *val = s < (initial_locals_count as usize);
+            if !has_pred && bi == 0 {
+                for (s, val) in inherited.iter_mut().enumerate() {
+                    *val = s < (initial_locals_count as usize);
+                }
+            } else if !has_pred {
+                inherited = vec![false; max_slots];
             }
-        } else if !has_pred {
-            inherited = vec![false; max_slots];
-        }
-        inherited_per_block[bi] = inherited.clone();
+            inherited_per_block[bi] = inherited.clone();
 
-        let start = block_offsets[bi];
-        let end = if bi + 1 < block_offsets.len() {
-            block_offsets[bi + 1]
-        } else {
-            code.len()
-        };
-        let mut assigned = inherited;
-        scan_stores(&code[..end], start, end, max_slots, &mut assigned);
-        live_at_end[bi] = assigned;
+            let start = block_offsets[bi];
+            let end = if bi + 1 < block_offsets.len() {
+                block_offsets[bi + 1]
+            } else {
+                code.len()
+            };
+            let mut assigned = inherited;
+            scan_stores(&code[..end], start, end, max_slots, &mut assigned);
+            if assigned != live_at_end[bi] {
+                live_at_end[bi] = assigned;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
     }
 
     // ── Collect ALL target offsets (inter-block + comparison-internal) ──
@@ -375,8 +386,7 @@ fn emit_method(
                             else_block,
                             ..
                         } => {
-                            *then_block as usize == *target_bi
-                                || *else_block as usize == *target_bi
+                            *then_block as usize == *target_bi || *else_block as usize == *target_bi
                         }
                         Terminator::Goto(t) => *t as usize == *target_bi,
                         _ => false,
@@ -596,9 +606,9 @@ fn walk_block(
                         bump(stack, max_stack, 1);
                         code.push(0xA7); // goto L_end
                         code.write_i16::<BigEndian>(4).unwrap(); // skip 1+3=4
-                        // L_true:
+                                                                 // L_true:
                         code.push(0x04); // iconst_1 (true)
-                        // L_end: (stack has one int)
+                                         // L_end: (stack has one int)
 
                         // Record intra-block branch targets for StackMapTable.
                         cmp_targets.push(CmpBranchTarget {
@@ -628,7 +638,8 @@ fn walk_block(
                         load_local(code, stack, max_stack, slots, a, &func.locals);
                         let arg_ty = &func.locals[a.0 as usize];
                         let descriptor = match arg_ty {
-                            Ty::Int | Ty::Bool => "(I)V",
+                            Ty::Bool => "(Z)V",
+                            Ty::Int => "(I)V",
                             Ty::String => "(Ljava/lang/String;)V",
                             _ => "(Ljava/lang/Object;)V",
                         };

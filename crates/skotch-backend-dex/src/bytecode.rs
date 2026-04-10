@@ -528,7 +528,8 @@ fn emit_call(
             // (op 0x6E, format 35c)
             let arg_ty = &locals[arg.0 as usize];
             let param_desc = match arg_ty {
-                Ty::Int | Ty::Bool => "I",
+                Ty::Bool => "Z",
+                Ty::Int => "I",
                 Ty::String => "Ljava/lang/String;",
                 _ => "Ljava/lang/Object;",
             };
@@ -584,7 +585,7 @@ fn emit_call(
                 let dest_reg = slot[&dest.0];
                 let move_op = match &target.return_ty {
                     Ty::Int | Ty::Bool => 0x0A, // move-result
-                    _ => 0x0C,                   // move-result-object
+                    _ => 0x0C,                  // move-result-object
                 };
                 code.push(opcode_aa(move_op, dest_reg as u8));
             }
