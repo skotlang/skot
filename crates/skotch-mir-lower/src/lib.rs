@@ -114,7 +114,7 @@ pub fn lower_file(
                     f,
                     fn_idx,
                     typed_fn,
-                    &name_to_func,
+                    &mut name_to_func,
                     &name_to_global,
                     &mut module,
                     interner,
@@ -243,21 +243,44 @@ fn lower_function(
     f: &FunDecl,
     fn_idx: usize,
     typed: Option<&skotch_typeck::TypedFunction>,
-    name_to_func: &FxHashMap<Symbol, FuncId>,
+    name_to_func: &mut FxHashMap<Symbol, FuncId>,
     name_to_global: &FxHashMap<Symbol, MirConst>,
     module: &mut MirModule,
     interner: &mut Interner,
     diags: &mut Diagnostics,
 ) {
     let name = interner.resolve(f.name).to_string();
-    let return_ty = typed.map(|t| t.return_ty.clone()).unwrap_or(Ty::Unit);
+    let return_ty = typed
+        .map(|t| t.return_ty.clone())
+        .or_else(|| {
+            f.return_ty
+                .as_ref()
+                .and_then(|tr| skotch_types::ty_from_name(interner.resolve(tr.name)))
+        })
+        .unwrap_or(Ty::Unit);
     let mut fb = FnBuilder::new(fn_idx, name.clone(), return_ty);
 
     // Allocate parameter locals first so they get LocalId 0..N.
     let mut scope: Vec<(Symbol, LocalId)> = Vec::new();
+
+    // For extension functions: add the receiver as the first parameter.
+    // It's accessible as `this` in the function body.
+    if let Some(recv) = &f.receiver_ty {
+        let recv_ty = skotch_types::ty_from_name(interner.resolve(recv.name)).unwrap_or(Ty::Any);
+        let id = fb.new_local(recv_ty);
+        fb.mf.params.push(id);
+        let this_sym = interner.intern("this");
+        scope.push((this_sym, id));
+    }
+
     for (pi, p) in f.params.iter().enumerate() {
         let ty = typed
-            .and_then(|t| t.param_tys.get(pi).cloned())
+            .and_then(|t| {
+                t.param_tys
+                    .get(pi + if f.receiver_ty.is_some() { 1 } else { 0 })
+                    .cloned()
+            })
+            .or_else(|| skotch_types::ty_from_name(interner.resolve(p.ty.name)))
             .unwrap_or(Ty::Any);
         let id = fb.new_local(ty);
         fb.mf.params.push(id);
@@ -310,7 +333,7 @@ fn lower_stmt(
     fb: &mut FnBuilder,
     scope: &mut Vec<(Symbol, LocalId)>,
     module: &mut MirModule,
-    name_to_func: &FxHashMap<Symbol, FuncId>,
+    name_to_func: &mut FxHashMap<Symbol, FuncId>,
     name_to_global: &FxHashMap<Symbol, MirConst>,
     interner: &mut Interner,
     diags: &mut Diagnostics,
@@ -590,6 +613,38 @@ fn lower_stmt(
             fb.terminate_and_switch(Terminator::Goto(cond_block), exit_block);
             true
         }
+        Stmt::LocalFun(f) => {
+            // Lower local function as a synthetic top-level function.
+            let fn_idx = module.functions.len();
+            let fn_name = interner.resolve(f.name).to_string();
+            let return_ty = f
+                .return_ty
+                .as_ref()
+                .and_then(|tr| skotch_types::ty_from_name(interner.resolve(tr.name)))
+                .unwrap_or(Ty::Unit);
+            module.functions.push(MirFunction {
+                id: FuncId(fn_idx as u32),
+                name: fn_name,
+                params: Vec::new(),
+                locals: Vec::new(),
+                blocks: Vec::new(),
+                return_ty: return_ty.clone(),
+            });
+            name_to_func.insert(f.name, FuncId(fn_idx as u32));
+
+            // Lower the function body.
+            lower_function(
+                f,
+                fn_idx,
+                None,
+                name_to_func,
+                name_to_global,
+                module,
+                interner,
+                diags,
+            );
+            true
+        }
         Stmt::Break(_) => {
             if let Some((_continue_blk, break_blk)) = loop_ctx {
                 fb.set_terminator(Terminator::Goto(break_blk));
@@ -611,7 +666,7 @@ fn lower_val_stmt(
     fb: &mut FnBuilder,
     scope: &mut Vec<(Symbol, LocalId)>,
     module: &mut MirModule,
-    name_to_func: &FxHashMap<Symbol, FuncId>,
+    name_to_func: &mut FxHashMap<Symbol, FuncId>,
     name_to_global: &FxHashMap<Symbol, MirConst>,
     interner: &mut Interner,
     diags: &mut Diagnostics,
@@ -647,7 +702,7 @@ fn lower_expr(
     fb: &mut FnBuilder,
     scope: &mut Vec<(Symbol, LocalId)>,
     module: &mut MirModule,
-    name_to_func: &FxHashMap<Symbol, FuncId>,
+    name_to_func: &mut FxHashMap<Symbol, FuncId>,
     name_to_global: &FxHashMap<Symbol, MirConst>,
     interner: &mut Interner,
     diags: &mut Diagnostics,
@@ -1030,6 +1085,63 @@ fn lower_expr(
             Some(result)
         }
         Expr::Call { callee, args, span } => {
+            // Handle method calls on a receiver: `receiver.method(args)`
+            // This is used for extension functions.
+            if let Expr::Field { receiver, name, .. } = callee.as_ref() {
+                let method_name = *name;
+                // Lower the receiver as the first argument.
+                let recv_local = lower_expr(
+                    receiver,
+                    fb,
+                    scope,
+                    module,
+                    name_to_func,
+                    name_to_global,
+                    interner,
+                    diags,
+                    loop_ctx,
+                )?;
+                let mut all_args = vec![recv_local];
+                for a in args {
+                    let id = lower_expr(
+                        a,
+                        fb,
+                        scope,
+                        module,
+                        name_to_func,
+                        name_to_global,
+                        interner,
+                        diags,
+                        loop_ctx,
+                    )?;
+                    all_args.push(id);
+                }
+
+                let kind = if let Some(fid) = name_to_func.get(&method_name) {
+                    CallKind::Static(*fid)
+                } else {
+                    diags.push(Diagnostic::error(
+                        *span,
+                        format!("unknown method `{}`", interner.resolve(method_name)),
+                    ));
+                    return None;
+                };
+
+                let dest_ty = match &kind {
+                    CallKind::Static(fid) => module.functions[fid.0 as usize].return_ty.clone(),
+                    _ => Ty::Unit,
+                };
+                let dest = fb.new_local(dest_ty);
+                fb.push_stmt(MStmt::Assign {
+                    dest,
+                    value: Rvalue::Call {
+                        kind,
+                        args: all_args,
+                    },
+                });
+                return Some(dest);
+            }
+
             let callee_name = match callee.as_ref() {
                 Expr::Ident(name, _) => *name,
                 _ => {
@@ -1397,7 +1509,7 @@ fn lower_template_part(
     fb: &mut FnBuilder,
     scope: &mut Vec<(Symbol, LocalId)>,
     module: &mut MirModule,
-    name_to_func: &FxHashMap<Symbol, FuncId>,
+    name_to_func: &mut FxHashMap<Symbol, FuncId>,
     name_to_global: &FxHashMap<Symbol, MirConst>,
     interner: &mut Interner,
     diags: &mut Diagnostics,
