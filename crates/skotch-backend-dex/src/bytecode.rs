@@ -354,7 +354,10 @@ fn walk_block(
             Rvalue::BinOp { op, lhs, rhs } => {
                 emit_binop(*op, *lhs, *rhs, *dest, slot, cmp_scratch, code);
             }
-            Rvalue::NewInstance(_) | Rvalue::GetField { .. } | Rvalue::PutField { .. } => {
+            Rvalue::NewInstance(_)
+            | Rvalue::GetField { .. }
+            | Rvalue::PutField { .. }
+            | Rvalue::GetStaticField { .. } => {
                 // TODO: class support in DEX backend
             }
             Rvalue::NewIntArray(_)
