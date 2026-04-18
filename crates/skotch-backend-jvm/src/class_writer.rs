@@ -942,8 +942,11 @@ fn emit_user_method(
     // but with an instance-method wrapper that:
     //  (a) uses ACC_PUBLIC (no STATIC)
     //  (b) builds the descriptor skipping `this` (JVM implicit)
-    if !is_init && func.suspend_state_machine.is_some() {
-        let sm = func.suspend_state_machine.as_ref().unwrap();
+    if let Some(sm) = if !is_init {
+        func.suspend_state_machine.as_ref()
+    } else {
+        None
+    } {
         // Build instance method descriptor: skip this (param[0]).
         let mut desc = String::from("(");
         for &p in func.params.iter().skip(1) {
@@ -3473,14 +3476,14 @@ fn emit_multi_suspend_state_machine_method(
                 } else {
                     // Loop mini-emitter for resume cases.
                     {
-                        struct RJP {
+                        struct Rjp {
                             off: usize,
                             insn: usize,
                             target: u32,
                         }
                         let mut rblk_offsets: FxHashMap<u32, usize> = FxHashMap::default();
                         let mut full_offsets: FxHashMap<u32, usize> = FxHashMap::default();
-                        let mut rpatches: Vec<RJP> = Vec::new();
+                        let mut rpatches: Vec<Rjp> = Vec::new();
                         let first_rbi = prev.block_idx;
                         let mut queue: Vec<(u32, usize)> =
                             vec![(prev.block_idx, (prev.stmt_idx as usize) + 1)];
@@ -3597,7 +3600,7 @@ fn emit_multi_suspend_state_machine_method(
                                     code.push(0x99); // ifeq → else
                                     let pp = code.len();
                                     code.write_i16::<BigEndian>(0).unwrap();
-                                    rpatches.push(RJP {
+                                    rpatches.push(Rjp {
                                         off: pp,
                                         insn: pp - 1,
                                         target: *else_block,
@@ -6129,14 +6132,13 @@ fn emit_lambda_multi_suspend_body(
                 } else {
                     // Loop mini-emitter for lambda resume cases.
                     {
-                        struct RJP {
+                        struct Rjp {
                             off: usize,
                             insn: usize,
                             target: u32,
                         }
                         let mut rblk_offsets: FxHashMap<u32, usize> = FxHashMap::default();
-                        let mut full_offsets: FxHashMap<u32, usize> = FxHashMap::default();
-                        let mut rpatches: Vec<RJP> = Vec::new();
+                        let mut rpatches: Vec<Rjp> = Vec::new();
                         let first_rbi = prev.block_idx;
                         let mut queue: Vec<(u32, usize)> =
                             vec![(prev.block_idx, (prev.stmt_idx as usize) + 1)];
@@ -6234,7 +6236,7 @@ fn emit_lambda_multi_suspend_body(
                                     code.push(0x99);
                                     let pp = code.len();
                                     code.write_i16::<BigEndian>(0).unwrap();
-                                    rpatches.push(RJP {
+                                    rpatches.push(Rjp {
                                         off: pp,
                                         insn: pp - 1,
                                         target: *else_block,
@@ -6587,6 +6589,7 @@ fn emit_lambda_multi_suspend_body(
 /// areturn`. Used for suspend lambdas whose bodies don't actually
 /// call any suspend function (e.g. `suspend { "hello" }` with no
 /// inner `yield_()`). No tableswitch, no label field access.
+#[allow(clippy::too_many_arguments)]
 fn emit_lambda_zero_suspend_body(
     resume_tail: &str,
     invoke_mir: Option<&MirFunction>,
@@ -6617,8 +6620,8 @@ fn emit_lambda_zero_suspend_body(
         let mut next_slot: u8 = 3; // 0=this, 1=$result, 2=spare
                                    // Pre-assign slots for all MIR locals
         for (i, _ty) in mf.locals.iter().enumerate() {
-            if !local_slot.contains_key(&(i as u32)) {
-                local_slot.insert(i as u32, next_slot);
+            if let std::collections::hash_map::Entry::Vacant(e) = local_slot.entry(i as u32) {
+                e.insert(next_slot);
                 next_slot += 1;
             }
         }

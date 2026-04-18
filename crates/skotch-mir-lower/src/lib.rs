@@ -1576,10 +1576,8 @@ enum SuspendSitesResult {
     /// marker's `sites` vector distinguishes them for the backend.
     Found(SuspendStateMachine),
     /// The function has suspend calls, but the body shape is
-    /// outside the Session 3/4 scope (e.g. non-`$completion`
-    /// suspend-call args, branches around suspend sites, …). The
-    /// caller turns this into a diagnostic so we don't silently
-    /// miscompile.
+    /// outside the current scope. Reserved for future use.
+    #[allow(dead_code)]
     Unsupported(String),
 }
 
